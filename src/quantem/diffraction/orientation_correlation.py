@@ -641,6 +641,18 @@ def plot_orientation_correlation(
     is fitted separately to the primary correlation-equals-one boundary
     between positive correlation and anticorrelation.
 
+    Angles are reported two ways, because an offset from the lobe is a width
+    and not a geometry. ``lobe_angle_degrees`` with ``lobe_orientation``
+    ("parallel" / "perpendicular") says how the two families sit relative to
+    each other, and ``annular_angle_degrees`` is the absolute relative
+    orientation the 50% boundary reaches, on the same 0-90 axis the panel
+    plots: read it directly, 0 is parallel and 90 is perpendicular.
+    ``annular_distance_degrees`` is that same crossing as an offset away from
+    the lobe, so it is the half-width and is meaningless without the lobe
+    angle. For an orthogonal pair whose lobe is at 90 degrees, an annular
+    distance of 9 degrees is an annular angle of 81 degrees -- still near
+    perpendicular, not near parallel.
+
     The relative-angle axis spans 0 to 90 degrees, not 0 to 180. Orientations
     are pi-periodic, so ``num_theta`` bins cover 180 degrees and the retained
     ``num_theta // 2 + 1`` lags are spaced ``180 / num_theta`` degrees apart.
@@ -815,6 +827,9 @@ def plot_orientation_correlation(
             else 0
         )
         lobe_angle = float(angles[lobe_index])
+        # The axis is bimodal by construction, so the lobe is one end or the other:
+        # 0 degrees means the two families are parallel, 90 means perpendicular.
+        lobe_orientation = "parallel" if lobe_index == 0 else "perpendicular"
         origin_probability = panel[lobe_index, 0]
         half_probability = (
             1.0 + 0.5 * (origin_probability - 1.0)
@@ -1074,11 +1089,18 @@ def plot_orientation_correlation(
             "title": title,
             "half_probability": float(half_probability),
             "lobe_angle_degrees": lobe_angle,
+            "lobe_orientation": lobe_orientation,
             "radial_distance": float(radial_distance),
             "radial_distance_censored": bool(radial_censored),
             "radial_distance_lower_bound": (
                 float(distance_max) if radial_censored else np.nan
             ),
+            # The absolute relative orientation the 50% boundary sits at, on the same
+            # 0-90 axis as the plot: read it directly, 0 is parallel and 90 is
+            # perpendicular. ``annular_distance_degrees`` is the same crossing expressed
+            # as an offset away from the lobe, which is a half-width rather than a
+            # geometry, and cannot be interpreted without ``lobe_angle_degrees``.
+            "annular_angle_degrees": float(annular_angle),
             "annular_distance_degrees": float(annular_distance),
             "annular_distance_censored": bool(annular_censored),
             "annular_distance_lower_bound_degrees": (
@@ -1119,13 +1141,23 @@ def plot_orientation_correlation(
                 if np.isfinite(slope)
                 else "not resolved"
             )
+            # Lead with the absolute angles so the panel is readable on its own: the lobe
+            # says whether the pair is parallel or perpendicular, and the annular angle is
+            # where the 50% boundary sits on the plotted axis. The offset from the lobe is
+            # kept in parentheses because that is the half-width.
+            annular_angle_text = (
+                f"{annular_angle:.2f} degrees ({annular_distance:.2f} from lobe)"
+                if np.isfinite(annular_angle)
+                else annular_text
+            )
             ax.text(
                 0.98,
                 0.98,
-                "50% radial distance = "
+                f"lobe = {lobe_angle:.0f} degrees ({lobe_orientation})"
+                + "\n50% radial distance = "
                 + radial_text
-                + "\n50% annular distance = "
-                + annular_text
+                + "\n50% annular angle = "
+                + annular_angle_text
                 + "\nslope = "
                 + slope_text,
                 transform=ax.transAxes,

@@ -353,6 +353,46 @@ def test_correlation_intercepts_unchanged_when_the_lobe_is_at_zero():
     )
 
 
+def test_annular_angle_is_reported_as_an_absolute_orientation():
+    """The annular intercept is also given directly on the 0-90 axis.
+
+    ``annular_distance_degrees`` is an offset away from the lobe, so the same
+    number means "near parallel" for an aligned pair and "near perpendicular"
+    for an orthogonal one. ``annular_angle_degrees`` removes that ambiguity by
+    reporting where the boundary actually sits, and must therefore sit on the
+    opposite side of the lobe in the two cases.
+    """
+    offset = 90 - 90 * (2.5 - 0.5) / 3.5
+
+    orthogonal = object.__new__(BraggPeaksPolymer)
+    orthogonal.orient_corr = _bimodal_panel()[None]  # lobe at 90
+    orthogonal.orient_corr_pairs = np.array([[0, 1]])
+    _, _, perpendicular_metrics = orthogonal.plot_orientation_correlation(
+        pixel_size=1.0, pixel_units="nm", return_metrics=True
+    )
+
+    aligned = object.__new__(BraggPeaksPolymer)
+    aligned.orient_corr = _bimodal_panel()[::-1][None]  # lobe at 0
+    aligned.orient_corr_pairs = np.array([[0, 0]])
+    _, _, parallel_metrics = aligned.plot_orientation_correlation(
+        pixel_size=1.0, pixel_units="nm", return_metrics=True
+    )
+
+    assert perpendicular_metrics[0]["lobe_orientation"] == "perpendicular"
+    assert parallel_metrics[0]["lobe_orientation"] == "parallel"
+
+    # Same half-width, opposite absolute angles: measured inwards from each lobe.
+    assert perpendicular_metrics[0]["annular_distance_degrees"] == pytest.approx(
+        parallel_metrics[0]["annular_distance_degrees"], abs=0.01
+    )
+    assert perpendicular_metrics[0]["annular_angle_degrees"] == pytest.approx(
+        90 - offset, abs=0.01
+    )
+    assert parallel_metrics[0]["annular_angle_degrees"] == pytest.approx(
+        offset, abs=0.01
+    )
+
+
 def test_interior_maximum_is_not_mistaken_for_a_lobe():
     """A weakly correlated pair peaking mid-axis is noise, not a lobe.
 
