@@ -2989,15 +2989,56 @@ class BraggPeaksPolymer(AutoSerialize):
         crosshair_size=12,
         autosave=False,
         display_widget=True,
+        backend="auto",
+        brush_radius=4,
     ):
         """Create an interactive scan-mask editor.
 
-        X is the horizontal scan-column coordinate and Y is the vertical
-        scan-row coordinate. Circle, ellipse, square, and rectangle geometries
-        are available, and all but the circle can be rotated by ``initial_angle``
-        (degrees anticlockwise) or with the Angle slider. Sizes are radii for round geometries and half-sizes for
-        rectangular geometries. A saved ``state_path`` is loaded automatically.
+        ``backend="paint"`` drags a brush over the scan image to add or erase
+        individual probe positions, which is the only way to select a region the
+        scan shows but no single shape describes. It needs ``quantem.widget``
+        (anywidget), since the matplotlib editor is delivered as a static image
+        and so has no pointer events. ``backend="shape"`` is the matplotlib
+        editor: X/Y/size sliders over a circle, ellipse, square or rectangle,
+        with X the scan column and Y the scan row, all but the circle rotatable
+        via ``initial_angle`` or the Angle slider, and sizes read as radii for
+        round geometries and half-sizes for rectangular ones. ``"auto"`` prefers
+        the painter and falls back to shapes when ``quantem.widget`` is missing.
+
+        Both write the same state file, so ``state_path`` is loaded automatically
+        by either and masks interchange between them. The painter takes the
+        geometry arguments as the seed mask it opens with.
         """
+        backend = str(backend).lower()
+        if backend not in {"auto", "paint", "shape"}:
+            raise ValueError(
+                f"backend must be 'auto', 'paint' or 'shape', got {backend!r}."
+            )
+        if backend in {"auto", "paint"}:
+            try:
+                from quantem.diffraction.scan_mask_painter import ScanMaskPainter
+            except ImportError as exc:
+                if backend == "paint":
+                    raise ImportError(
+                        "backend='paint' needs quantem.widget; install it or pass "
+                        "backend='shape' for the matplotlib editor."
+                    ) from exc
+            else:
+                return ScanMaskPainter(
+                    self,
+                    initial_x=initial_x,
+                    initial_y=initial_y,
+                    initial_radius=initial_radius,
+                    initial_geometry=initial_geometry,
+                    initial_size_x=initial_size_x,
+                    initial_size_y=initial_size_y,
+                    initial_angle=initial_angle,
+                    reference_image=reference_image,
+                    state_path=state_path,
+                    autosave=autosave,
+                    display_widget=display_widget,
+                    brush_radius=brush_radius,
+                )
         return ScanMaskEditor(
             self,
             initial_x=initial_x,
@@ -3034,8 +3075,13 @@ class BraggPeaksPolymer(AutoSerialize):
         Historically ``initial_x0`` represented the array row and
         ``initial_y0`` represented the array column. New code should use
         ``edit_scan_mask(initial_x=column, initial_y=row, ...)``.
+
+        Pinned to the matplotlib editor: the callers this exists for read back
+        ``.x`` / ``.y`` / ``.radius`` and pass the overlay and crosshair
+        styling, none of which the painter has.
         """
         return self.edit_scan_mask(
+            backend="shape",
             initial_x=initial_y0,
             initial_y=initial_x0,
             initial_radius=initial_r,

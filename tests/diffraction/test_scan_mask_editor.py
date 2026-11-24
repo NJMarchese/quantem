@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from quantem.diffraction import BraggPeaksPolymer, ScanMaskEditor
+from quantem.diffraction.scan_mask_editor import resolve_reference_image
 
 
 def _analysis(scan_shape=(7, 9)):
@@ -26,6 +27,7 @@ def _analysis(scan_shape=(7, 9)):
 def test_controls_follow_probe_directions_and_apply_is_explicit():
     analysis = _analysis()
     editor = analysis.edit_scan_mask(
+        backend="shape",
         initial_x=4,
         initial_y=3,
         initial_radius=2,
@@ -74,6 +76,7 @@ def test_saved_mask_is_loaded_and_applied(tmp_path):
     path = tmp_path / "scan_mask.npz"
     first = _analysis()
     editor = first.edit_scan_mask(
+        backend="shape",
         initial_x=2,
         initial_y=3,
         initial_radius=2,
@@ -95,6 +98,7 @@ def test_saved_mask_is_loaded_and_applied(tmp_path):
 
     second = _analysis()
     loaded = second.edit_scan_mask(
+        backend="shape",
         initial_x=0,
         initial_y=0,
         initial_radius=1,
@@ -120,6 +124,7 @@ def test_saved_mask_is_loaded_and_applied(tmp_path):
 def test_saved_mask_rejects_a_different_scan_shape(tmp_path):
     path = tmp_path / "scan_mask.npz"
     editor = _analysis().edit_scan_mask(
+        backend="shape",
         state_path=path, display_widget=False
     )
     try:
@@ -129,6 +134,7 @@ def test_saved_mask_rejects_a_different_scan_shape(tmp_path):
 
     with pytest.raises(ValueError, match="does not match current scan shape"):
         _analysis((8, 9)).edit_scan_mask(
+            backend="shape",
             state_path=path, display_widget=False
         )
     plt.close("all")
@@ -148,6 +154,7 @@ def test_version_one_circle_state_remains_loadable(tmp_path):
         radius=np.asarray(2),
     )
     editor = _analysis().edit_scan_mask(
+        backend="shape",
         state_path=path, display_widget=False
     )
     try:
@@ -190,6 +197,7 @@ def test_geometry_selector_builds_expected_masks(
     geometry, size_x, size_y, expected_count
 ):
     editor = _analysis().edit_scan_mask(
+        backend="shape",
         initial_x=4,
         initial_y=3,
         display_widget=False,
@@ -326,3 +334,34 @@ def test_angle_round_trips_through_a_saved_state(tmp_path):
     assert reloaded.geometry == "ellipse"
     np.testing.assert_array_equal(np.asarray(reloaded.mask), saved_mask)
     reloaded.close()
+
+
+def test_reference_image_survives_a_numpy_backed_dataset():
+    """The mask has to be drawn over visible scan contrast, not a black square.
+
+    ``Dataset.tensor`` raises ``AttributeError`` when the dataset is numpy-backed,
+    which is what ``em.io.read_4dstem`` produces, so probing only ``.tensor``
+    reports "no data" for the common case and the editor renders an empty image.
+    """
+    analysis = _analysis()
+    reference = resolve_reference_image(analysis, None, (7, 9))
+
+    assert reference.shape == (7, 9)
+    assert not np.allclose(reference, 0.0)
+    assert reference.min() < reference.max()
+
+
+def test_both_backends_agree_on_the_reference_image():
+    analysis = _analysis()
+    expected = np.asarray(analysis.dataset_cartesian.array).mean(axis=(-2, -1))
+
+    shape_editor = analysis.edit_scan_mask(backend="shape", display_widget=False)
+    try:
+        np.testing.assert_allclose(shape_editor.reference_image, expected)
+    finally:
+        shape_editor.close()
+
+    painter = pytest.importorskip(
+        "quantem.diffraction.scan_mask_painter"
+    ).ScanMaskPainter(analysis, display_widget=False)
+    np.testing.assert_allclose(painter.reference_image, expected)

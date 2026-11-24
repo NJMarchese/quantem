@@ -23,7 +23,169 @@ from ipywidgets import Button, HBox, VBox
 from IPython.display import clear_output, display
 from matplotlib.patches import Ellipse, Rectangle
 
-__all__ = ["ScanMaskEditor"]
+__all__ = [
+    "ScanMaskEditor",
+    "GEOMETRIES",
+    "geometry_footprint",
+    "read_mask_state",
+    "resolve_reference_image",
+    "write_mask_state",
+]
+
+SCHEMA_VERSION = 3
+GEOMETRIES = ("circle", "ellipse", "square", "rectangle")
+
+
+def resolve_reference_image(analysis, reference_image, scan_shape):
+    """Scan-space image the mask editors draw the mask over.
+
+    Prefers a stored virtual image, else reduces the 4D data over the detector
+    axes. Both storage backings have to be probed, and neither can be probed
+    alone: ``.array`` is ``None`` on a tensor-backed dataset, while ``.tensor``
+    raises ``AttributeError`` on a numpy-backed one.
+    """
+    if reference_image is None:
+        dataset = analysis.dataset_cartesian
+        virtual_images = getattr(dataset, "virtual_images", {}) or {}
+        if "virtual_image" in virtual_images:
+            stored = virtual_images["virtual_image"]
+            reference_image = getattr(
+                stored, "array", getattr(stored, "data", stored)
+            )
+        else:
+            array = getattr(dataset, "array", None)
+            if array is not None:
+                reference_image = np.asarray(array).mean(axis=(-2, -1))
+            else:
+                # Raises for a dataset that is neither backing, which is a real
+                # error and must not silently become a blank reference image.
+                reference_image = (
+                    dataset.tensor.float().mean(dim=(-2, -1)).detach().cpu().numpy()
+                )
+    reference_image = np.asarray(reference_image, dtype=float)
+    if reference_image.shape != tuple(scan_shape):
+        raise ValueError(
+            f"reference_image shape {reference_image.shape} must match "
+            f"scan shape {tuple(scan_shape)}."
+        )
+    return reference_image
+
+
+def geometry_footprint(scan_shape, row, column, geometry, size_x, size_y, angle=0.0):
+    """Boolean mask for one geometry, rotated ``angle`` degrees anticlockwise.
+
+    The shape is rotated by rotating the sampling grid the other way, so the
+    axis-aligned inside-tests below are unchanged. A circle is invariant, so
+    the rotation is skipped for it.
+    """
+    yy, xx = np.ogrid[: scan_shape[0], : scan_shape[1]]
+    dy = yy - row
+    dx = xx - column
+    if angle and geometry != "circle":
+        radians = np.deg2rad(float(angle))
+        cos, sin = np.cos(radians), np.sin(radians)
+        dx, dy = dx * cos + dy * sin, -dx * sin + dy * cos
+    if geometry == "circle":
+        return dy**2 + dx**2 <= size_x**2
+    if geometry == "ellipse":
+        return (dx / size_x) ** 2 + (dy / size_y) ** 2 <= 1
+    if geometry == "square":
+        return (np.abs(dx) <= size_x) & (np.abs(dy) <= size_x)
+    if geometry == "rectangle":
+        return (np.abs(dx) <= size_x) & (np.abs(dy) <= size_y)
+    raise ValueError(f"Unknown mask geometry {geometry!r}.")
+
+
+def read_mask_state(path, scan_shape, schema_version=SCHEMA_VERSION):
+    """Load a saved scan-mask state file, validating shape and schema."""
+    scan_shape = tuple(int(v) for v in scan_shape)
+    try:
+        with np.load(path, allow_pickle=False) as state:
+            version = int(state["schema_version"])
+            shape = tuple(int(v) for v in state["scan_shape"])
+            if version not in {1, 2, schema_version}:
+                raise ValueError(
+                    f"Unsupported scan-mask schema {version}; expected "
+                    f"1, 2 or {schema_version}."
+                )
+            if shape != scan_shape:
+                raise ValueError(
+                    f"Saved scan-mask shape {shape} does not match current "
+                    f"scan shape {scan_shape}."
+                )
+            mask = np.asarray(state["mask"], dtype=bool)
+            if mask.shape != scan_shape:
+                raise ValueError(
+                    f"Saved mask array shape {mask.shape} does not match "
+                    f"scan shape {scan_shape}."
+                )
+            if version == 1:
+                geometry = "circle"
+                size_x = size_y = int(state["radius"])
+            else:
+                geometry = str(state["geometry"].item())
+                size_x = int(state["size_x"])
+                size_y = int(state["size_y"])
+            # Rotation arrived in schema 3; older files are axis-aligned.
+            angle = float(state["angle"]) if version >= 3 else 0.0
+            return {
+                "center_row": int(state["center_row"]),
+                "center_column": int(state["center_column"]),
+                "geometry": geometry,
+                "size_x": size_x,
+                "size_y": size_y,
+                "angle": angle,
+                "mask": mask,
+            }
+    except (OSError, KeyError) as exc:
+        raise ValueError(f"Could not load scan-mask state from {path}: {exc}") from exc
+
+
+def write_mask_state(
+    path,
+    *,
+    mask,
+    geometry,
+    center_row,
+    center_column,
+    radius,
+    size_x,
+    size_y,
+    angle,
+    scan_shape,
+    sampling,
+    units,
+    schema_version=SCHEMA_VERSION,
+):
+    """Atomically write a scan-mask state file.
+
+    ``mask`` is stored verbatim, so an arbitrary painted mask round-trips even
+    though the geometry fields only describe a single shape.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="wb", suffix=".npz", dir=path.parent, delete=False
+    ) as stream:
+        temporary_path = Path(stream.name)
+        np.savez_compressed(
+            stream,
+            schema_version=np.asarray(schema_version, dtype=np.int64),
+            mask=np.asarray(mask, dtype=bool),
+            mask_type=np.asarray(geometry),
+            geometry=np.asarray(geometry),
+            center_row=np.asarray(center_row, dtype=np.int64),
+            center_column=np.asarray(center_column, dtype=np.int64),
+            radius=np.asarray(radius, dtype=np.int64),
+            size_x=np.asarray(size_x, dtype=np.int64),
+            size_y=np.asarray(size_y, dtype=np.int64),
+            angle=np.asarray(angle, dtype=np.float64),
+            scan_shape=np.asarray(scan_shape, dtype=np.int64),
+            sampling=np.asarray(sampling, dtype=float),
+            units=np.asarray([str(v) for v in units], dtype="U32"),
+        )
+    temporary_path.replace(path)
+    return path
 
 
 class ScanMaskEditor:
@@ -548,97 +710,15 @@ class ScanMaskEditor:
             )
 
     def _geometry_mask(self, row, column, geometry, size_x, size_y, angle=0.0):
-        """Boolean mask for one geometry, rotated ``angle`` degrees anticlockwise.
-
-        The shape is rotated by rotating the sampling grid the other way, so the
-        axis-aligned inside-tests below are unchanged. A circle is invariant, so
-        the rotation is skipped for it.
-        """
-        yy, xx = np.ogrid[: self.scan_shape[0], : self.scan_shape[1]]
-        dy = yy - row
-        dx = xx - column
-        if angle and geometry != "circle":
-            radians = np.deg2rad(float(angle))
-            cos, sin = np.cos(radians), np.sin(radians)
-            dx, dy = dx * cos + dy * sin, -dx * sin + dy * cos
-        if geometry == "circle":
-            return dy**2 + dx**2 <= size_x**2
-        if geometry == "ellipse":
-            return (dx / size_x) ** 2 + (dy / size_y) ** 2 <= 1
-        if geometry == "square":
-            return (np.abs(dx) <= size_x) & (np.abs(dy) <= size_x)
-        if geometry == "rectangle":
-            return (np.abs(dx) <= size_x) & (np.abs(dy) <= size_y)
-        raise ValueError(f"Unknown mask geometry {geometry!r}.")
+        return geometry_footprint(
+            self.scan_shape, row, column, geometry, size_x, size_y, angle
+        )
 
     def _resolve_reference_image(self, reference_image):
-        if reference_image is None:
-            virtual_images = getattr(self.analysis.dataset_cartesian, "virtual_images", {})
-            if "virtual_image" in virtual_images:
-                reference_image = virtual_images["virtual_image"]
-                reference_image = getattr(
-                    reference_image,
-                    "array",
-                    getattr(reference_image, "data", reference_image),
-                )
-            else:
-                dataset = self.analysis.dataset_cartesian
-                array = getattr(dataset, "array", None)
-                if array is not None:
-                    reference_image = np.asarray(array).mean(axis=(-2, -1))
-                else:
-                    reference_image = (
-                        dataset.tensor.float().mean(dim=(-2, -1)).detach().cpu().numpy()
-                    )
-        reference_image = np.asarray(reference_image, dtype=float)
-        if reference_image.shape != self.scan_shape:
-            raise ValueError(
-                f"reference_image shape {reference_image.shape} must match "
-                f"scan shape {self.scan_shape}."
-            )
-        return reference_image
+        return resolve_reference_image(self.analysis, reference_image, self.scan_shape)
 
     def _read_state(self, path):
-        try:
-            with np.load(path, allow_pickle=False) as state:
-                version = int(state["schema_version"])
-                shape = tuple(int(v) for v in state["scan_shape"])
-                if version not in {1, 2, self.SCHEMA_VERSION}:
-                    raise ValueError(
-                        f"Unsupported scan-mask schema {version}; expected "
-                        f"1, 2 or {self.SCHEMA_VERSION}."
-                    )
-                if shape != self.scan_shape:
-                    raise ValueError(
-                        f"Saved scan-mask shape {shape} does not match current "
-                        f"scan shape {self.scan_shape}."
-                    )
-                mask = np.asarray(state["mask"], dtype=bool)
-                if mask.shape != self.scan_shape:
-                    raise ValueError(
-                        f"Saved mask array shape {mask.shape} does not match "
-                        f"scan shape {self.scan_shape}."
-                    )
-                if version == 1:
-                    geometry = "circle"
-                    size_x = size_y = int(state["radius"])
-                else:
-                    geometry = str(state["geometry"].item())
-                    size_x = int(state["size_x"])
-                    size_y = int(state["size_y"])
-                # Rotation arrived in schema 3; older files are axis-aligned.
-                angle = float(state["angle"]) if version >= 3 else 0.0
-                return {
-                    "center_row": int(state["center_row"]),
-                    "center_column": int(state["center_column"]),
-                    "geometry": geometry,
-                    "size_x": size_x,
-                    "size_y": size_y,
-                    "angle": angle,
-                    "mask": mask,
-                }
-        except (OSError, KeyError) as exc:
-            raise ValueError(f"Could not load scan-mask state from {path}: {exc}") from exc
+        return read_mask_state(path, self.scan_shape, self.SCHEMA_VERSION)
 
     def set_mask(
         self,
@@ -709,33 +789,21 @@ class ScanMaskEditor:
             raise ValueError("No scan-mask state_path was configured.")
         if apply_first:
             self.apply()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        sampling = np.asarray(self.analysis.dataset_cartesian.sampling[:2], dtype=float)
-        units = np.asarray(
-            [str(value) for value in self.analysis.dataset_cartesian.units[:2]],
-            dtype="U32",
+        write_mask_state(
+            path,
+            mask=self._preview_mask,
+            geometry=self.geometry,
+            center_row=self.y,
+            center_column=self.x,
+            radius=self.radius,
+            size_x=self.size_x,
+            size_y=self.size_y,
+            angle=self.angle,
+            scan_shape=self.scan_shape,
+            sampling=self.analysis.dataset_cartesian.sampling[:2],
+            units=self.analysis.dataset_cartesian.units[:2],
+            schema_version=self.SCHEMA_VERSION,
         )
-        with tempfile.NamedTemporaryFile(
-            mode="wb", suffix=".npz", dir=path.parent, delete=False
-        ) as stream:
-            temporary_path = Path(stream.name)
-            np.savez_compressed(
-                stream,
-                schema_version=np.asarray(self.SCHEMA_VERSION, dtype=np.int64),
-                mask=self._preview_mask.astype(bool),
-                mask_type=np.asarray(self.geometry),
-                geometry=np.asarray(self.geometry),
-                center_row=np.asarray(self.y, dtype=np.int64),
-                center_column=np.asarray(self.x, dtype=np.int64),
-                radius=np.asarray(self.radius, dtype=np.int64),
-                size_x=np.asarray(self.size_x, dtype=np.int64),
-                size_y=np.asarray(self.size_y, dtype=np.int64),
-                angle=np.asarray(self.angle, dtype=np.float64),
-                scan_shape=np.asarray(self.scan_shape, dtype=np.int64),
-                sampling=sampling,
-                units=units,
-            )
-        temporary_path.replace(path)
         self.state_path = path
         self.save_button.disabled = False
         self._saved = True
