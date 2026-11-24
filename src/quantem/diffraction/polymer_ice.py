@@ -60,13 +60,26 @@ class IceFlaggerParams:
     # same q is an annularly broad arc. Widths are full-width-at-half-maximum
     # measured on the polar intensity volume at each candidate's (r, theta).
     #
-    # max_width_theta_deg is the discriminating one: it separates ice from polymer
-    # for dots and streaks alike. max_width_r_invA is available but rarely useful --
+    # ``max_width_*`` gates the persistent-crossing *envelope* FWHM. Wave-like
+    # profiles can have a sharp central core but a broad envelope because shallow
+    # troughs do not persist below half maximum. ``max_core_width_*`` gates a
+    # first-crossing FWHM measured after the same Gaussian smoothing; this is often
+    # the better early ice-candidate gate for those profiles. ``min_envelope_core_*``
+    # optionally selects profiles whose envelope is substantially broader than
+    # their core. All configured criteria are ANDed and run inside the q band,
+    # before intensity and six-fold geometry.
+    #
+    # max_width_theta_deg is usually the discriminating envelope ceiling. The
+    # radial ceilings are available but rarely useful --
     # ice dots and polymer arcs have similar radial widths, so it separates streaks
     # from dots (a distinction within ice) rather than ice from polymer. Ceilings
     # are ANDed; None on either leaves that axis ungated, which is the default.
     max_width_r_invA: float | None = None
     max_width_theta_deg: float | None = None
+    max_core_width_r_invA: float | None = None
+    max_core_width_theta_deg: float | None = None
+    min_envelope_core_ratio_r: float | None = None
+    min_envelope_core_ratio_theta: float | None = None
     # Half-width of the search window used to measure each FWHM. A candidate
     # whose profile never falls to half maximum inside the window is reported
     # as wider than the window, i.e. broad, and is rejected.
@@ -85,11 +98,11 @@ class IceFlaggerParams:
     # Bins of local argmax refinement, to absorb the sub-bin offset between a
     # detected peak position and the polar volume's sampling grid.
     sharpness_refine_bins: int = 2
-    # Noise robustness. A half-maximum walk that stops at the FIRST sample below
-    # half is fooled by a weak, diffuse arc: one downward fluctuation ends it a few
-    # bins out, so a broad noisy feature reports as narrow as a sharp one. The
-    # profile is Gaussian-smoothed with this sigma (in bins), and the crossing must
-    # stay below half for `sharpness_crossing_persistence` samples to count. The
+    # Noise robustness. Both core and envelope measurements use this Gaussian
+    # smoothing sigma (in bins). The core then takes the first crossing; the envelope
+    # requires it to stay below half for `sharpness_crossing_persistence` samples.
+    # This lets the core retain real trough information after high-frequency noise
+    # is suppressed, while the envelope follows shallow troughs and side lobes. The
     # kernel width is then removed in quadrature -- exact for a Gaussian convolved
     # with a Gaussian, which is why this is a Gaussian and not a boxcar. Set the
     # sigma to 0 and the persistence to 1 for the raw first-crossing behaviour.
@@ -134,6 +147,10 @@ class IceFlaggerParams:
         optional_positive = {
             "max_width_r_invA": self.max_width_r_invA,
             "max_width_theta_deg": self.max_width_theta_deg,
+            "max_core_width_r_invA": self.max_core_width_r_invA,
+            "max_core_width_theta_deg": self.max_core_width_theta_deg,
+            "min_envelope_core_ratio_r": self.min_envelope_core_ratio_r,
+            "min_envelope_core_ratio_theta": self.min_envelope_core_ratio_theta,
             "min_phi_separation_deg": self.min_phi_separation_deg,
             "theta_period_deg": self.theta_period_deg,
         }
@@ -273,16 +290,35 @@ def _half_width_bins(
     back down reads as at least as broad as the window.
     """
 
+    return _half_width_details(profile, center, direction, half, persistence)[0]
+
+
+def _half_width_details(
+    profile: NDArray[np.floating],
+    center: int,
+    direction: int,
+    half: float,
+    persistence: int = 1,
+) -> tuple[float, list[int]]:
+    """Crossing distance plus the below-half samples that validate it.
+
+    This is the single source of truth for both the detector's width and the
+    widget's crossing visualization. ``evidence`` begins at the first sample at
+    or below half height and contains the sustained run inspected by the
+    persistence rule (shorter only when it reaches the profile-window edge).
+    """
+
     n = len(profile)
     need = max(1, int(persistence))
     previous = float(profile[center])
     for step in range(1, n):
         index = center + direction * step
         if index < 0 or index >= n:
-            return float(step - 1)
+            return float(step - 1), []
         value = float(profile[index])
         if not np.isfinite(value) or value <= half:
             run = True
+            evidence = [index]
             for ahead in range(1, need):
                 probe = center + direction * (step + ahead)
                 if probe < 0 or probe >= n:
@@ -291,12 +327,13 @@ def _half_width_bins(
                 if np.isfinite(nxt) and nxt > half:
                     run = False
                     break
+                evidence.append(probe)
             if run:
                 span = previous - value
                 fraction = (previous - half) / span if span > 0 else 0.0
-                return (step - 1) + float(np.clip(fraction, 0.0, 1.0))
+                return ((step - 1) + float(np.clip(fraction, 0.0, 1.0)), evidence)
         previous = value
-    return float(n)
+    return float(n), []
 
 
 def _profile_fwhm(
@@ -349,22 +386,29 @@ def measure_peak_widths(
     theta_axis: NDArray[np.floating],
     *,
     params: IceFlaggerParams = IceFlaggerParams(),
-) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
-    """Radial (1/Å) and annular (degrees) FWHM for each peak of one pattern.
+    return_core: bool = False,
+):
+    """Persistent-envelope FWHM for each peak, optionally with first-crossing cores.
 
     ``polar_intensity`` is that pattern's polar transform, indexed
     ``[radial_bin, annular_bin]``; ``r_axis`` and ``theta_axis`` are its
     coordinate axes (1/Å and radians). The annular axis is treated as periodic,
     the radial axis is not. Peaks that fall outside the sampled radial range
-    get ``inf``, so they never pass a sharpness ceiling.
+    get ``inf``, so they never pass a sharpness ceiling. With ``return_core=True``,
+    return ``(envelope_r, envelope_theta, core_r, core_theta)``. Core widths use
+    the first half-height crossing (persistence 1) after the same smoothing;
+    envelope widths use ``sharpness_crossing_persistence``.
     """
 
     radius = np.asarray(r_invA, dtype=float)
     theta = np.asarray(theta_rad, dtype=float)
     width_r = np.full(radius.shape, np.inf)
     width_theta = np.full(radius.shape, np.inf)
+    core_width_r = np.full(radius.shape, np.inf)
+    core_width_theta = np.full(radius.shape, np.inf)
     if not radius.size or polar_intensity.size == 0 or len(r_axis) < 2 or len(theta_axis) < 2:
-        return width_r, width_theta
+        return ((width_r, width_theta, core_width_r, core_width_theta)
+                if return_core else (width_r, width_theta))
 
     r_step = float(r_axis[1] - r_axis[0])
     theta_step_deg = float(np.rad2deg(theta_axis[1] - theta_axis[0]))
@@ -397,6 +441,14 @@ def measure_peak_widths(
             smooth_sigma_bins=params.sharpness_smooth_sigma_bins,
             persistence=params.sharpness_crossing_persistence,
         )
+        core_fwhm_theta, _ = _profile_fwhm(
+            annular,
+            window_theta,
+            baseline_quantile=params.sharpness_baseline_quantile,
+            refine_bins=params.sharpness_refine_bins,
+            smooth_sigma_bins=params.sharpness_smooth_sigma_bins,
+            persistence=1,
+        )
         theta_bin = int(theta_indices[min(refined, len(theta_indices) - 1)])
 
         low = max(0, r_bin - window_r)
@@ -409,9 +461,20 @@ def measure_peak_widths(
             smooth_sigma_bins=params.sharpness_smooth_sigma_bins,
             persistence=params.sharpness_crossing_persistence,
         )
+        core_fwhm_r, _ = _profile_fwhm(
+            radial,
+            r_bin - low,
+            baseline_quantile=params.sharpness_baseline_quantile,
+            refine_bins=params.sharpness_refine_bins,
+            smooth_sigma_bins=params.sharpness_smooth_sigma_bins,
+            persistence=1,
+        )
         width_r[index] = fwhm_r * r_step
         width_theta[index] = fwhm_theta * theta_step_deg
-    return width_r, width_theta
+        core_width_r[index] = core_fwhm_r * r_step
+        core_width_theta[index] = core_fwhm_theta * theta_step_deg
+    return ((width_r, width_theta, core_width_r, core_width_theta)
+            if return_core else (width_r, width_theta))
 
 
 def _resolve_theta_period(params: IceFlaggerParams, fallback: float | None) -> float:
@@ -423,19 +486,60 @@ def _resolve_theta_period(params: IceFlaggerParams, fallback: float | None) -> f
 
 
 def _sharpness_enabled(params: IceFlaggerParams) -> bool:
-    return params.max_width_r_invA is not None or params.max_width_theta_deg is not None
+    return any(value is not None for value in (
+        params.max_width_r_invA,
+        params.max_width_theta_deg,
+        params.max_core_width_r_invA,
+        params.max_core_width_theta_deg,
+        params.min_envelope_core_ratio_r,
+        params.min_envelope_core_ratio_theta,
+    ))
+
+
+def envelope_core_ratio(envelope, core) -> NDArray[np.floating]:
+    """Persistent-envelope FWHM divided by first-crossing core FWHM."""
+
+    envelope = np.asarray(envelope, dtype=float)
+    core = np.asarray(core, dtype=float)
+    ratio = np.full(np.broadcast_shapes(envelope.shape, core.shape), np.nan, dtype=float)
+    np.divide(
+        envelope,
+        core,
+        out=ratio,
+        where=np.isfinite(envelope) & np.isfinite(core) & (core > 0),
+    )
+    ratio[np.isfinite(envelope) & (envelope > 0) & (core == 0)] = np.inf
+    return ratio
 
 
 def sharpness_mask(
-    width_r: NDArray[np.floating], width_theta: NDArray[np.floating], params: IceFlaggerParams
+    width_r: NDArray[np.floating],
+    width_theta: NDArray[np.floating],
+    params: IceFlaggerParams,
+    *,
+    core_width_r: NDArray[np.floating] | None = None,
+    core_width_theta: NDArray[np.floating] | None = None,
 ) -> NDArray[np.bool_]:
-    """Which peaks pass the configured width ceilings.
+    """Which peaks pass the configured envelope/core sharpness criteria.
 
-    The ceilings are ANDed; an axis with no ceiling passes everything, so setting
-    only ``max_width_theta_deg`` gates on annular sharpness alone. Public so a
-    tuning preview can apply exactly the gate the flagger applies, rather than
-    reimplementing it. Non-finite widths fail any ceiling that is set.
+    All configured criteria are ANDed. ``width_*`` are the persistent-crossing
+    envelope widths retained for backward compatibility. Core widths are required
+    when a core ceiling or envelope/core-ratio floor is configured. Non-finite
+    values fail the corresponding configured criterion.
     """
+
+    needs_core_r = (
+        params.max_core_width_r_invA is not None
+        or params.min_envelope_core_ratio_r is not None
+    )
+    needs_core_theta = (
+        params.max_core_width_theta_deg is not None
+        or params.min_envelope_core_ratio_theta is not None
+    )
+    if needs_core_r and core_width_r is None:
+        raise ValueError("core_width_r is required by the configured sharpness criteria")
+    if needs_core_theta and core_width_theta is None:
+        raise ValueError("core_width_theta is required by the configured sharpness criteria")
 
     radial_ok = (
         np.ones(width_r.shape, dtype=bool)
@@ -447,7 +551,35 @@ def sharpness_mask(
         if params.max_width_theta_deg is None
         else width_theta <= params.max_width_theta_deg
     )
-    return radial_ok & annular_ok
+    core_radial_ok = (
+        np.ones(width_r.shape, dtype=bool)
+        if params.max_core_width_r_invA is None
+        else np.asarray(core_width_r) <= params.max_core_width_r_invA
+    )
+    core_annular_ok = (
+        np.ones(width_theta.shape, dtype=bool)
+        if params.max_core_width_theta_deg is None
+        else np.asarray(core_width_theta) <= params.max_core_width_theta_deg
+    )
+    ratio_radial_ok = (
+        np.ones(width_r.shape, dtype=bool)
+        if params.min_envelope_core_ratio_r is None
+        else envelope_core_ratio(width_r, core_width_r) >= params.min_envelope_core_ratio_r
+    )
+    ratio_annular_ok = (
+        np.ones(width_theta.shape, dtype=bool)
+        if params.min_envelope_core_ratio_theta is None
+        else envelope_core_ratio(width_theta, core_width_theta)
+        >= params.min_envelope_core_ratio_theta
+    )
+    return (
+        radial_ok
+        & annular_ok
+        & core_radial_ok
+        & core_annular_ok
+        & ratio_radial_ok
+        & ratio_annular_ok
+    )
 
 
 def _angle_distance(
@@ -560,13 +692,20 @@ def flag_ice_peaks_in_pattern(
     if _sharpness_enabled(params):
         if polar_intensity is None or r_axis is None or theta_axis is None:
             raise ValueError(
-                "A sharpness ceiling (max_width_r_invA / max_width_theta_deg) requires the "
+                "A sharpness width/core/ratio criterion requires the "
                 "polar intensity volume; pass polar_data through detect_ice()."
             )
-        width_r, width_theta = measure_peak_widths(
-            radius, theta, polar_intensity, r_axis, theta_axis, params=params
+        width_r, width_theta, core_width_r, core_width_theta = measure_peak_widths(
+            radius, theta, polar_intensity, r_axis, theta_axis,
+            params=params, return_core=True,
         )
-        q_candidates &= sharpness_mask(width_r, width_theta, params)
+        q_candidates &= sharpness_mask(
+            width_r,
+            width_theta,
+            params,
+            core_width_r=core_width_r,
+            core_width_theta=core_width_theta,
+        )
         n_sharp = int(np.count_nonzero(q_candidates))
     if params.intensity_cutoff is None:
         threshold = float(intensity_threshold_global)
@@ -753,7 +892,7 @@ def detect_ice(
     if _sharpness_enabled(params):
         if polar_data is None:
             raise ValueError(
-                "A sharpness ceiling (max_width_r_invA / max_width_theta_deg) requires "
+                "A sharpness width/core/ratio criterion requires "
                 "polar_data; run process_polar() first, or clear the ceilings."
             )
         polar_intensity_stack = np.asarray(polar_data["intensity"])
@@ -929,15 +1068,17 @@ def collect_peak_widths(
 ) -> dict[str, NDArray]:
     """Measure every peak's radial/annular width, flattened across the scan.
 
-    This is the tuning counterpart to the sharpness ceilings: histogram
-    ``width_r_invA`` against ``width_theta_deg`` to see where the sharp ice
-    population separates from the broad polymer one, then set
-    ``max_width_r_invA`` / ``max_width_theta_deg`` between them.
+    This is the tuning counterpart to the sharpness criteria. The legacy
+    ``width_*`` columns are persistent-crossing envelope widths.
+    ``core_width_*`` uses the first crossing after the same smoothing, and
+    ``envelope_core_ratio_*`` reveals narrow cores inside broad/wave-like
+    envelopes. These diagnostics let you choose a core ceiling before enabling
+    it in the pre-geometry candidate gate.
 
     With ``q_band_only`` the measurement is restricted to the flagger's q window,
     which is both far cheaper and the only population the gate ever sees.
     Returns flat arrays keyed ``iy``, ``ix``, ``q_invA``, ``theta_deg``,
-    ``intensity``, ``width_r_invA``, ``width_theta_deg``.
+    ``intensity``, envelope widths, core widths, and envelope/core ratios.
     """
 
     shape = polar_peaks.shape
@@ -953,7 +1094,10 @@ def collect_peak_widths(
 
     columns: dict[str, list] = {key: [] for key in
                                 ("iy", "ix", "q_invA", "theta_deg", "intensity",
-                                 "width_r_invA", "width_theta_deg")}
+                                 "width_r_invA", "width_theta_deg",
+                                 "core_width_r_invA", "core_width_theta_deg",
+                                 "envelope_core_ratio_r",
+                                 "envelope_core_ratio_theta")}
     for iy, ix in np.argwhere(selected):
         iy, ix = int(iy), int(ix)
         polar_cell = polar_peaks[iy, ix].array
@@ -971,8 +1115,9 @@ def collect_peak_widths(
         if not keep.any():
             continue
         radius, theta, values = radius[keep], theta[keep], values[keep]
-        width_r, width_theta = measure_peak_widths(
-            radius, theta, intensity_stack[iy, ix], r_axis, theta_axis, params=params
+        width_r, width_theta, core_width_r, core_width_theta = measure_peak_widths(
+            radius, theta, intensity_stack[iy, ix], r_axis, theta_axis,
+            params=params, return_core=True,
         )
         columns["iy"].extend([iy] * len(radius))
         columns["ix"].extend([ix] * len(radius))
@@ -981,6 +1126,14 @@ def collect_peak_widths(
         columns["intensity"].extend(values)
         columns["width_r_invA"].extend(width_r)
         columns["width_theta_deg"].extend(width_theta)
+        columns["core_width_r_invA"].extend(core_width_r)
+        columns["core_width_theta_deg"].extend(core_width_theta)
+        columns["envelope_core_ratio_r"].extend(
+            envelope_core_ratio(width_r, core_width_r)
+        )
+        columns["envelope_core_ratio_theta"].extend(
+            envelope_core_ratio(width_theta, core_width_theta)
+        )
     return {key: np.asarray(value) for key, value in columns.items()}
 
 
@@ -1006,6 +1159,7 @@ __all__ = [
     "collect_peak_widths",
     "compute_global_intensity_threshold",
     "detect_ice",
+    "envelope_core_ratio",
     "flag_ice_peaks_in_dataset",
     "flag_ice_peaks_in_pattern",
     "measure_peak_widths",

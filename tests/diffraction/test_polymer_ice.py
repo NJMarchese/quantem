@@ -5,7 +5,8 @@ import pytest
 
 from quantem.core.datastructures import Vector
 from quantem.diffraction import (IceFlaggerParams, detect_ice,
-                                 measure_peak_widths, sharpness_mask)
+                                 envelope_core_ratio, measure_peak_widths,
+                                 sharpness_mask)
 
 
 def _vectors(shape=(1, 2)):
@@ -537,6 +538,56 @@ def test_smoothing_is_deconvolved_so_sharp_peaks_stay_unbiased():
     assert abs(smoothed - raw) < 2.0
 
 
+def test_first_crossing_core_separates_sharp_core_from_wave_like_envelope():
+    """A shallow one-bin trough ends the core but not the persistent envelope."""
+    r_axis = np.linspace(0.0, 1.0, 101)
+    theta_axis = np.deg2rad(np.arange(0.0, 180.0, 2.0))
+    image = np.zeros((len(r_axis), len(theta_axis)))
+    r_bin, theta_bin = 27, 22
+    profile = np.zeros(len(theta_axis))
+    profile[theta_bin] = 10.0
+    for direction in (-1, 1):
+        profile[theta_bin + direction * 1] = 8.0
+        profile[theta_bin + direction * 2] = 6.0
+        profile[theta_bin + direction * 3] = 3.0
+        profile[theta_bin + direction * 4] = 8.0
+        profile[theta_bin + direction * 5] = 7.0
+        profile[theta_bin + direction * 6] = 6.0
+    image[r_bin, :] = profile
+    params = IceFlaggerParams(
+        sharpness_smooth_sigma_bins=0.5,
+        sharpness_crossing_persistence=3,
+        max_core_width_theta_deg=12.0,
+        min_envelope_core_ratio_theta=1.5,
+    )
+
+    envelope_r, envelope_theta, core_r, core_theta = measure_peak_widths(
+        [r_axis[r_bin]], [theta_axis[theta_bin]], image, r_axis, theta_axis,
+        params=params, return_core=True,
+    )
+    ratio = envelope_core_ratio(envelope_theta, core_theta)
+
+    assert core_theta[0] < envelope_theta[0]
+    assert ratio[0] > 1.5
+    assert sharpness_mask(
+        envelope_r, envelope_theta, params,
+        core_width_r=core_r, core_width_theta=core_theta,
+    )[0]
+
+
+def test_core_ceiling_can_replace_envelope_ceiling_for_wave_like_peaks():
+    envelope = np.array([30.0])
+    core = np.array([7.0])
+    core_gate = IceFlaggerParams(max_core_width_theta_deg=10.0)
+    envelope_gate = IceFlaggerParams(max_width_theta_deg=10.0)
+
+    assert sharpness_mask(
+        envelope, envelope, core_gate,
+        core_width_r=core, core_width_theta=core,
+    )[0]
+    assert not sharpness_mask(envelope, envelope, envelope_gate)[0]
+
+
 @pytest.mark.parametrize("kwargs,match", [
     ({"dq_invA": 0}, "dq_invA must be positive"),
     ({"dtheta_deg": -1}, "dtheta_deg must be positive"),
@@ -545,6 +596,8 @@ def test_smoothing_is_deconvolved_so_sharp_peaks_stay_unbiased():
     ({"max_crystallites": 0}, "max_crystallites must be at least 1"),
     ({"sharpness_crossing_persistence": 0}, "sharpness_crossing_persistence"),
     ({"max_width_theta_deg": 0}, "max_width_theta_deg must be positive when set"),
+    ({"max_core_width_theta_deg": 0}, "max_core_width_theta_deg must be positive when set"),
+    ({"min_envelope_core_ratio_theta": 0}, "min_envelope_core_ratio_theta must be positive"),
     ({"sharpness_baseline_quantile": 1.0}, "must be in \\[0, 1\\)"),
     ({"sharpness_smooth_sigma_bins": -1}, "must be non-negative"),
     ({"intensity_cutoff_mode": "nope"}, "must be 'absolute' or 'percentile'"),

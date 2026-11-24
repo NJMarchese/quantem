@@ -43,13 +43,17 @@ _WIDTH_CACHE: dict[tuple, dict] = {}
 
 
 def peak_widths(bp, params, *, use_cache=True):
-    """Radial/annular FWHM for every peak in the ice q band, across the scan.
+    """Envelope/core FWHM and their ratios for peaks in the ice q band.
 
-    Cached on the q band and intensity field, which are the only inputs that
-    change the measurement, so sweeping the ceilings costs nothing.
+    Cached on the q band and profile-measurement settings, so sweeping only the
+    envelope/core/ratio gate thresholds costs nothing.
     """
-    key = (id(bp), params.q_target_invA, params.dq_invA, params.intensity_field,
-           params.sharpness_window_theta_deg, params.sharpness_smooth_sigma_bins)
+    key = (
+        id(bp), params.q_target_invA, params.dq_invA, params.intensity_field,
+        params.sharpness_window_r_invA, params.sharpness_window_theta_deg,
+        params.sharpness_baseline_quantile, params.sharpness_refine_bins,
+        params.sharpness_smooth_sigma_bins, params.sharpness_crossing_persistence,
+    )
     if use_cache and key in _WIDTH_CACHE:
         return _WIDTH_CACHE[key]
     print("measuring peak widths over the q band (cached until the q band changes)...")
@@ -58,8 +62,19 @@ def peak_widths(bp, params, *, use_cache=True):
     return widths
 
 
-def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None,
-                  fig_path=None, use_cache=True):
+def selection_box(
+    bp,
+    params,
+    *,
+    max_width_r_invA=None,
+    max_width_theta_deg=None,
+    max_core_width_r_invA=None,
+    max_core_width_theta_deg=None,
+    min_envelope_core_ratio_r=None,
+    min_envelope_core_ratio_theta=None,
+    fig_path=None,
+    use_cache=True,
+):
     """Preview the sharpness gate as a box in (width, intensity), and return the params.
 
     Assign the result back to your params object; nothing is mutated in place::
@@ -67,26 +82,40 @@ def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None
         params_ice_flagger = selection_box(bp, params_ice_flagger,
                                            max_width_theta_deg=8.0)
 
-    The ceilings are ANDed, and an unset axis is not gated. Ice is annularly
-    sharp -- compact dots and radial streaks alike -- while polymer at the same q
-    is an annularly broad arc, so ``max_width_theta_deg`` is normally the only one
-    you need; a radial ceiling mostly rejects the streaks.
+    All configured criteria are ANDed. For smooth profiles the persistent
+    envelope and first-crossing core are similar. A wave-like sharp peak has a
+    narrow core, broad envelope, and ratio above one. To admit both ordinary and
+    wave-like sharp ice candidates, normally clear ``max_width_theta_deg`` and set
+    ``max_core_width_theta_deg``; geometry still runs afterward. A minimum ratio
+    is optional and specifically selects the wave-like subset, so do not enable it
+    when ordinary sharp ice must also pass.
     """
     tuned = dataclasses.replace(
         params,
         max_width_r_invA=max_width_r_invA,
         max_width_theta_deg=max_width_theta_deg,
+        max_core_width_r_invA=max_core_width_r_invA,
+        max_core_width_theta_deg=max_core_width_theta_deg,
+        min_envelope_core_ratio_r=min_envelope_core_ratio_r,
+        min_envelope_core_ratio_theta=min_envelope_core_ratio_theta,
     )
     widths = peak_widths(bp, tuned, use_cache=use_cache)
     width_r = widths["width_r_invA"]
     width_theta = widths["width_theta_deg"]
+    core_width_r = widths["core_width_r_invA"]
+    core_width_theta = widths["core_width_theta_deg"]
+    ratio_r = widths["envelope_core_ratio_r"]
+    ratio_theta = widths["envelope_core_ratio_theta"]
     intensity = widths["intensity"]
 
     # A percentile cutoff is resolved per scan inside detect_ice, so preview it as
     # "no floor" rather than guessing the value it will take.
     floor = tuned.intensity_cutoff if tuned.intensity_cutoff is not None else -np.inf
     floor_label = "none" if not np.isfinite(floor) else f"{floor:.4g}"
-    selected = sharpness_mask(width_r, width_theta, tuned) & (intensity >= floor)
+    selected = sharpness_mask(
+        width_r, width_theta, tuned,
+        core_width_r=core_width_r, core_width_theta=core_width_theta,
+    ) & (intensity >= floor)
     total = len(width_r)
     print(f"box selects {selected.sum()} of {total} q-band peaks "
           f"({100 * selected.sum() / max(total, 1):.1f}%)")
@@ -95,8 +124,14 @@ def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None
     # not separate the populations and its ceiling buys nothing.
     bright, dim = intensity >= floor, intensity < floor
     quantiles = [0.05, 0.25, 0.5, 0.75, 0.95]
-    for label, values, digits in (("radial FWHM (1/Å)", width_r, 4),
-                                  ("annular FWHM (deg)", width_theta, 2)):
+    for label, values, digits in (
+        ("radial envelope FWHM (1/Å)", width_r, 4),
+        ("annular envelope FWHM (deg)", width_theta, 2),
+        ("radial core FWHM (1/Å)", core_width_r, 4),
+        ("annular core FWHM (deg)", core_width_theta, 2),
+        ("radial envelope/core ratio", ratio_r, 2),
+        ("annular envelope/core ratio", ratio_theta, 2),
+    ):
         print(f"{label} quantiles {quantiles}")
         for group_label, group in ((f"intensity >= {floor_label}", bright),
                                    (f"intensity <  {floor_label}", dim)):
@@ -105,7 +140,9 @@ def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None
                   np.round(np.quantile(values[finite], quantiles), digits)
                   if finite.any() else "none")
 
-    fig, ((ax_r, ax_t), (ax_rt, ax_map)) = plt.subplots(2, 2, figsize=(12.5, 9))
+    fig, ((ax_r, ax_t, ax_core_t), (ax_rt, ax_core_env, ax_map)) = plt.subplots(
+        2, 3, figsize=(17, 9)
+    )
 
     def width_panel(ax, values, ceiling, xlabel):
         finite = np.isfinite(values)
@@ -126,8 +163,12 @@ def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None
                title=f"{xlabel} vs intensity"
                      + ("" if ceiling is not None else "  (no ceiling set)"))
 
-    width_panel(ax_r, width_r, tuned.max_width_r_invA, "radial FWHM (1/Å)")
-    width_panel(ax_t, width_theta, tuned.max_width_theta_deg, "annular FWHM (deg)")
+    width_panel(ax_r, width_r, tuned.max_width_r_invA, "radial envelope FWHM (1/Å)")
+    width_panel(ax_t, width_theta, tuned.max_width_theta_deg, "annular envelope FWHM (deg)")
+    width_panel(
+        ax_core_t, core_width_theta, tuned.max_core_width_theta_deg,
+        "annular first-crossing core FWHM (deg)",
+    )
 
     # The plane the gate cuts in. Ceilings are ANDed, so the keep-region is the
     # corner under both; with no radial ceiling it is the band below the annular one.
@@ -148,6 +189,36 @@ def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None
     ax_rt.set(xlabel="radial FWHM (1/Å)", ylabel="annular FWHM (deg)",
               title=f"radial vs annular FWHM  (intensity >= {floor_label})")
 
+    # This is the diagnostic that separates a sharp core inside a wave-like
+    # envelope from a genuinely smooth broad peak. Smooth peaks lie near y=x.
+    core_plane = np.isfinite(core_width_theta) & np.isfinite(width_theta) & bright
+    hist = ax_core_env.hist2d(
+        core_width_theta[core_plane], width_theta[core_plane], bins=(80, 80),
+        norm=LogNorm(), cmap="magma",
+    )
+    fig.colorbar(hist[3], ax=ax_core_env, label="count (log)")
+    x_lo, x_hi = ax_core_env.get_xlim()
+    y_lo, y_hi = ax_core_env.get_ylim()
+    diagonal = np.linspace(max(0.0, x_lo), x_hi, 100)
+    ax_core_env.plot(diagonal, diagonal, color="white", ls=":", lw=1.5, label="ratio = 1")
+    if tuned.max_core_width_theta_deg is not None:
+        ax_core_env.axvline(tuned.max_core_width_theta_deg, color="cyan", ls="--", lw=2)
+    if tuned.max_width_theta_deg is not None:
+        ax_core_env.axhline(tuned.max_width_theta_deg, color="cyan", ls="--", lw=2)
+    if tuned.min_envelope_core_ratio_theta is not None:
+        ax_core_env.plot(
+            diagonal, tuned.min_envelope_core_ratio_theta * diagonal,
+            color="lime", ls="--", lw=2,
+            label=f"ratio = {tuned.min_envelope_core_ratio_theta:g}",
+        )
+    ax_core_env.set(
+        xlim=(x_lo, x_hi), ylim=(y_lo, y_hi),
+        xlabel="annular core FWHM (deg)",
+        ylabel="annular envelope FWHM (deg)",
+        title=f"annular core vs envelope  (intensity >= {floor_label})",
+    )
+    ax_core_env.legend(loc="best", fontsize=8)
+
     # Ice should be compact blobs on the scan, not sprinkled everywhere.
     selected_map = np.zeros(bp.polar_peaks.shape, dtype=int)
     np.add.at(selected_map, (widths["iy"][selected], widths["ix"][selected]), 1)
@@ -162,11 +233,15 @@ def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None
         fig.savefig(fig_path, format="pdf", bbox_inches="tight")
     plt.show()
 
-    print(f"\nreturned params: max_width_r_invA={tuned.max_width_r_invA}, "
-          f"max_width_theta_deg={tuned.max_width_theta_deg}, "
-          f"intensity_cutoff={tuned.intensity_cutoff}")
-    print(f"detect_ice can flag at most these {selected.sum()} peaks; the six-fold "
-          "alignment then drops those not sitting in an aligned pattern.")
+    print(f"\nreturned envelope ceilings: radial={tuned.max_width_r_invA}, "
+          f"annular={tuned.max_width_theta_deg}")
+    print(f"returned core ceilings: radial={tuned.max_core_width_r_invA}, "
+          f"annular={tuned.max_core_width_theta_deg}")
+    print(f"returned minimum envelope/core ratios: radial="
+          f"{tuned.min_envelope_core_ratio_r}, annular="
+          f"{tuned.min_envelope_core_ratio_theta}")
+    print(f"detect_ice first applies these criteria to the q-band candidates; at most "
+          f"these {selected.sum()} peaks then reach intensity and six-fold geometry.")
     return tuned
 
 
@@ -335,22 +410,29 @@ def probe_peaks(bp, params, ry, rx, *, n_show=4, q_band_only=True):
         raise ValueError(f"no peaks at ({ry},{rx})"
                          + (" in the q band" if q_band_only else ""))
 
-    width_r, width_theta = measure_peak_widths(q, theta, image, r_axis, theta_axis,
-                                               params=params)
-    gate_r, gate_t = params.max_width_r_invA, params.max_width_theta_deg
+    width_r, width_theta, core_width_r, core_width_theta = measure_peak_widths(
+        q, theta, image, r_axis, theta_axis, params=params, return_core=True,
+    )
+    ratio_theta = np.divide(
+        width_theta, core_width_theta,
+        out=np.full(width_theta.shape, np.nan),
+        where=np.isfinite(width_theta) & np.isfinite(core_width_theta) & (core_width_theta > 0),
+    )
     print(f"position ({ry}, {rx}) -- {len(q)} peaks"
           f"{' in the q band' if q_band_only else ''}\n")
     print(f"{'#':>3} {'q 1/Å':>8} {'d Å':>7} {'theta°':>8} {'intens':>8} "
-          f"{'radFWHM':>9} {'annFWHM':>9}  gate")
+          f"{'radEnv':>9} {'annEnv':>9} {'annCore':>9} {'env/core':>9}  gate")
     for k in np.argsort(-values):
-        pass_r = gate_r is None or width_r[k] <= gate_r
-        pass_t = gate_t is None or width_theta[k] <= gate_t
-        verdict = ("sharp" if (pass_r and pass_t) else
-                   "broad-r" if not pass_r and pass_t else
-                   "broad-t" if pass_r else "broad-rt")
+        passed = sharpness_mask(
+            width_r[k:k + 1], width_theta[k:k + 1], params,
+            core_width_r=core_width_r[k:k + 1],
+            core_width_theta=core_width_theta[k:k + 1],
+        )[0]
+        verdict = "sharp" if passed else "broad"
         print(f"{k:>3} {q[k]:>8.4f} {1 / max(q[k], 1e-9):>7.2f} "
               f"{np.rad2deg(theta[k]):>8.1f} {values[k]:>8.4f} "
-              f"{width_r[k]:>9.4f} {width_theta[k]:>9.1f}  {verdict}")
+              f"{width_r[k]:>9.4f} {width_theta[k]:>9.1f} "
+              f"{core_width_theta[k]:>9.1f} {ratio_theta[k]:>9.2f}  {verdict}")
 
     order = np.argsort(-values)[:n_show]
     theta_step = float(np.rad2deg(theta_axis[1] - theta_axis[0]))
@@ -365,6 +447,8 @@ def probe_peaks(bp, params, ry, rx, *, n_show=4, q_band_only=True):
         ax.plot(r_axis, image[:, theta_bin], lw=1)
         ax.axvline(q[k], color="tab:red", ls=":")
         ax.axvspan(q[k] - width_r[k] / 2, q[k] + width_r[k] / 2, color="tab:red", alpha=0.15)
+        ax.axvspan(q[k] - core_width_r[k] / 2, q[k] + core_width_r[k] / 2,
+                   color="tab:green", alpha=0.2)
         ax.set(xlim=(q[k] - 6 * max(width_r[k], r_step), q[k] + 6 * max(width_r[k], r_step)),
                xlabel="q (1/Å)", ylabel="intensity",
                title=f"peak {k}: radial cut, FWHM={width_r[k]:.4f} 1/Å")
@@ -375,9 +459,14 @@ def probe_peaks(bp, params, ry, rx, *, n_show=4, q_band_only=True):
         ax.axvline(center, color="tab:red", ls=":")
         ax.axvspan(center - width_theta[k] / 2, center + width_theta[k] / 2,
                    color="tab:red", alpha=0.15)
+        ax.axvspan(center - core_width_theta[k] / 2, center + core_width_theta[k] / 2,
+                   color="tab:green", alpha=0.2)
         ax.set(xlim=(0, 180), xlabel="theta (deg)", ylabel="intensity",
                title=f"peak {k}: annular cut, FWHM={width_theta[k]:.1f}°")
     fig.tight_layout()
     plt.show()
     return {"q_invA": q, "theta_rad": theta, "intensity": values,
-            "width_r_invA": width_r, "width_theta_deg": width_theta}
+            "width_r_invA": width_r, "width_theta_deg": width_theta,
+            "core_width_r_invA": core_width_r,
+            "core_width_theta_deg": core_width_theta,
+            "envelope_core_ratio_theta": ratio_theta}
