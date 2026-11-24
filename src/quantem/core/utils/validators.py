@@ -168,6 +168,105 @@ def validate_units(value: Union[list[str], tuple, list, str], ndim: int) -> list
     return [str(unit) for unit in value]
 
 
+# Canonical name and multiplier to nanometres for each recognised real-space unit. Keys
+# are matched after the normalisation in `parse_real_units`, so only lower-case,
+# space-free spellings with a GREEK SMALL LETTER MU (U+03BC) need to appear here.
+_REAL_UNIT_TO_NM: dict[str, tuple[str, float]] = {
+    "m": ("m", 1e9),
+    "meter": ("m", 1e9),
+    "metre": ("m", 1e9),
+    "meters": ("m", 1e9),
+    "metres": ("m", 1e9),
+    "cm": ("cm", 1e7),
+    "centimeter": ("cm", 1e7),
+    "centimetre": ("cm", 1e7),
+    "mm": ("mm", 1e6),
+    "millimeter": ("mm", 1e6),
+    "millimetre": ("mm", 1e6),
+    "\u03bcm": ("\u03bcm", 1e3),
+    "um": ("\u03bcm", 1e3),
+    "micron": ("\u03bcm", 1e3),
+    "microns": ("\u03bcm", 1e3),
+    "micrometer": ("\u03bcm", 1e3),
+    "micrometre": ("\u03bcm", 1e3),
+    "micrometers": ("\u03bcm", 1e3),
+    "micrometres": ("\u03bcm", 1e3),
+    "nm": ("nm", 1.0),
+    "nanometer": ("nm", 1.0),
+    "nanometre": ("nm", 1.0),
+    "nanometers": ("nm", 1.0),
+    "nanometres": ("nm", 1.0),
+    "a": ("A", 0.1),
+    "\u00e5": ("A", 0.1),
+    "angstrom": ("A", 0.1),
+    "angstroms": ("A", 0.1),
+    "\u00e5ngstr\u00f6m": ("A", 0.1),
+    "pm": ("pm", 1e-3),
+    "picometer": ("pm", 1e-3),
+    "picometre": ("pm", 1e-3),
+    "picometers": ("pm", 1e-3),
+    "picometres": ("pm", 1e-3),
+}
+
+# Axes that carry no real-space length. Asking for nanometres on these is a category
+# error rather than an unknown unit, so they resolve to NaN (see `parse_real_units`).
+_DIMENSIONLESS_UNITS = frozenset({"", "pixel", "pixels", "px", "index", "arb.units", "arb"})
+_RECIPROCAL_MARKERS = ("/", "^-1", "-1", "\u207b\u00b9", "inv_", "per_")
+
+
+def parse_real_units(unit_string: str) -> tuple[str, float]:
+    """Return a canonical real-space unit and its multiplier to nanometres.
+
+    The real-space counterpart of
+    :func:`quantem.diffraction.polymer_utils.parse_reciprocal_units`. Use it whenever a
+    sampling value has to become a physical length: one pixel is a different distance on
+    every scan, so hard-coded pixel counts silently rescale flowline spacing, correlation
+    distances and scale bars between datasets.
+
+    Reciprocal (``"1/nm"``) and dimensionless (``"pixels"``) units return a NaN
+    multiplier instead of raising -- a 4D-STEM dataset legitimately mixes real-space scan
+    axes with reciprocal detector axes, and NaN propagates visibly into any figure that
+    misuses it. Only a genuinely unrecognised unit raises, because the alternative is a
+    quiet multiplicative error in a published number.
+
+    Parameters
+    ----------
+    unit_string : str
+        Unit to interpret, e.g. ``"nm"``, ``"\u00b5m"``, ``"Angstrom"``.
+
+    Returns
+    -------
+    tuple[str, float]
+        The canonical unit name and the factor that converts a value in `unit_string`
+        to nanometres. The factor is NaN for reciprocal and dimensionless units.
+
+    Raises
+    ------
+    ValueError
+        If `unit_string` is neither a recognised length, a reciprocal unit, nor
+        dimensionless.
+    """
+    # `str.lower()` leaves MICRO SIGN (U+00B5) alone, and DigitalMicrograph writes that
+    # codepoint rather than GREEK SMALL LETTER MU (U+03BC), so fold it explicitly --
+    # otherwise every micrometre-calibrated scan looks like an unknown unit.
+    normalized = (
+        str(unit_string).strip().lower().replace(" ", "").replace("\u00b5", "\u03bc")
+    )
+
+    if normalized in _REAL_UNIT_TO_NM:
+        return _REAL_UNIT_TO_NM[normalized]
+
+    if normalized in _DIMENSIONLESS_UNITS or any(
+        marker in normalized for marker in _RECIPROCAL_MARKERS
+    ):
+        return normalized, float("nan")
+
+    raise ValueError(
+        f"Cannot convert a sampling in {unit_string!r} to nanometres: unrecognized "
+        f"real-space unit. Supported units: {sorted(_REAL_UNIT_TO_NM)}."
+    )
+
+
 def validate_pathlike(value: os.PathLike | str | None) -> Path | None:
     if value is None:
         return

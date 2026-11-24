@@ -10,6 +10,7 @@ from numpy.typing import DTypeLike, NDArray
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.validators import (
     ensure_valid_array,
+    parse_real_units,
     validate_ndinfo,
     validate_pathlike,
     validate_units,
@@ -198,6 +199,30 @@ class Dataset(AutoSerialize):
     @units.setter
     def units(self, value: list[str] | tuple[str, ...] | list) -> None:
         self._units = validate_units(value, self.ndim)
+
+    @property
+    def sampling_nm(self) -> NDArray:
+        """Per-axis sampling converted to nanometres, from `sampling` and `units`.
+
+        Readers take axis units verbatim from the file, so `sampling` is in whatever
+        unit the microscope wrote -- DigitalMicrograph commonly writes micrometres for
+        the scan axes, a factor of 1000 away from the nanometres that downstream
+        physical lengths (flowline spacing, correlation distances, scale bars) assume.
+        Convert through here rather than reading `sampling` directly:
+
+        >>> dataset = read_4dstem(path, file_type="digitalmicrograph")  # doctest: +SKIP
+        >>> scan_step_nm = dataset.sampling_nm[0]  # doctest: +SKIP
+
+        Axes with no real-space length are NaN rather than an error, so this stays
+        usable on a 4D-STEM dataset whose detector axes are reciprocal: a NaN
+        propagates visibly into any figure that misuses one, while an exception would
+        make the property useless on the mixed case. An axis whose unit is not
+        recognised at all raises instead -- see :func:`parse_real_units`.
+        """
+        return np.array(
+            [parse_real_units(unit)[1] * value for value, unit in zip(self._sampling, self._units)],
+            dtype=float,
+        )
 
     @property
     def signal_units(self) -> str:

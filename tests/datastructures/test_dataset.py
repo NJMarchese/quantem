@@ -153,6 +153,41 @@ class TestDatasetProperties:
         with pytest.raises(ValueError):
             sample_dataset_2d.units = ["Å", "Å", "Å"]  # Wrong number of dimensions
 
+    def test_sampling_nm_converts_from_axis_units(self, sample_dataset_2d):
+        """sampling_nm honours the axis units instead of assuming nanometres."""
+        sample_dataset_2d.sampling = (1.5, 1.5)
+        sample_dataset_2d.units = ["nm", "nm"]
+        assert np.allclose(sample_dataset_2d.sampling_nm, [1.5, 1.5])
+
+        sample_dataset_2d.units = ["Å", "Å"]
+        assert np.allclose(sample_dataset_2d.sampling_nm, [0.15, 0.15])
+
+        # DigitalMicrograph writes MICRO SIGN (U+00B5), not GREEK SMALL LETTER MU
+        # (U+03BC); both must convert, or µm-calibrated scans come out 1000x wrong.
+        for micro in ("\u00b5m", "\u03bcm"):
+            sample_dataset_2d.units = [micro, micro]
+            assert np.allclose(sample_dataset_2d.sampling_nm, [1500.0, 1500.0])
+
+    def test_sampling_nm_is_nan_for_non_length_axes(self, sample_dataset_2d):
+        """Reciprocal and uncalibrated axes yield NaN rather than raising."""
+        # A 4D-STEM dataset mixes real-space scan axes with reciprocal detector axes,
+        # so a mixed dataset must stay usable.
+        sample_dataset_2d.sampling = (0.02, 0.5)
+        sample_dataset_2d.units = ["µm", "1/nm"]
+        result = sample_dataset_2d.sampling_nm
+        assert np.isclose(result[0], 20.0)
+        assert np.isnan(result[1])
+
+        # `pixels` is the reader default for an uncalibrated axis.
+        sample_dataset_2d.units = ["pixels", "pixels"]
+        assert np.all(np.isnan(sample_dataset_2d.sampling_nm))
+
+    def test_sampling_nm_rejects_unknown_units(self, sample_dataset_2d):
+        """An unrecognised unit raises instead of silently mis-scaling a figure."""
+        sample_dataset_2d.units = ["furlong", "furlong"]
+        with pytest.raises(ValueError, match="unrecognized real-space unit"):
+            sample_dataset_2d.sampling_nm
+
     def test_signal_units_property(self, sample_dataset_2d):
         """Test signal_units property getter and setter."""
         # Test getter
