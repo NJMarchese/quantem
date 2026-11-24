@@ -610,7 +610,31 @@ def find_origin_angular_descent(
         n_phi,
         device,
     )[0]
-    start_centers = torch.round(global_origin)[None].expand(n_patterns, 2).clone()
+    # Seed each pattern from its OWN centre of mass, not from the global origin.
+    # The descent has a fixed reach -- schedule=(4,2,1) x sweeps=2 is at most 14 px
+    # along any one axis -- so a single global seed silently fails wherever the beam
+    # sits further than that from the scan-mean centre: the descent stops part-way,
+    # on a slope rather than in a minimum, leaving a centre a few px off the beam
+    # (and exactly integer-valued, because the 3x3 quadratic polish only applies an
+    # offset when the patch brackets an interior minimum). A per-pattern CoM seed is
+    # always within a few px of that pattern's own beam, so the reach never binds.
+    #
+    # The global origin is kept as a fallback and the better-scoring of the two is
+    # used per pattern: CoM is pulled off the beam by strongly asymmetric scattering,
+    # so this cannot do worse than the previous global-only behaviour.
+    com_starts = torch.round(_com_anchors_batched(patterns))
+    global_starts = torch.round(global_origin)[None].expand(n_patterns, 2).clone()
+    pattern_ids = torch.arange(n_patterns, device=device)
+    com_scores = _local_score_pairs(
+        patterns, pattern_ids, com_starts, offset_row, offset_col,
+        ring_weights, n_phi, device,
+    )
+    global_scores = _local_score_pairs(
+        patterns, pattern_ids, global_starts, offset_row, offset_col,
+        ring_weights, n_phi, device,
+    )
+    use_com = (com_scores <= global_scores) & torch.isfinite(com_scores)
+    start_centers = torch.where(use_com[:, None], com_starts, global_starts).clone()
     origins = _descend_batched(
         patterns,
         start_centers,
@@ -874,6 +898,28 @@ def _com_anchor(pattern: torch.Tensor) -> torch.Tensor:
     center_row = (rows[:, None] * clipped).sum() / total
     center_col = (cols[None, :] * clipped).sum() / total
     return torch.stack([center_row, center_col])
+
+
+def _com_anchors_batched(patterns: torch.Tensor) -> torch.Tensor:
+    """Per-pattern centre-of-mass anchor, ``(n_patterns, 2)``.
+
+    Batched form of :func:`_com_anchor`. Patterns with no positive signal fall back
+    to the geometric centre, matching the single-pattern helper.
+    """
+    n_patterns, n_row, n_col = patterns.shape
+    clipped = patterns.clamp(min=0)
+    total = clipped.sum(dim=(1, 2))
+    rows = torch.arange(n_row, device=patterns.device, dtype=torch.float32)
+    cols = torch.arange(n_col, device=patterns.device, dtype=torch.float32)
+    center_row = (clipped.sum(dim=2) * rows).sum(dim=1) / (total + 1e-9)
+    center_col = (clipped.sum(dim=1) * cols).sum(dim=1) / (total + 1e-9)
+    anchors = torch.stack([center_row, center_col], dim=1)
+    geometric = torch.tensor(
+        [(n_row - 1) / 2.0, (n_col - 1) / 2.0],
+        dtype=torch.float32,
+        device=patterns.device,
+    )
+    return torch.where((total > 0)[:, None], anchors, geometric[None])
 
 
 def _local_sampling(radial_min, radial_max, n_phi, n_radial, kpow, ellipse_params, device):

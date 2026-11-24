@@ -70,6 +70,30 @@ def test_windows_bracket_their_centres_and_stay_in_range(bp):
     assert np.all((windows[:, 1] - windows[:, 0]) >= 0.05 - 1e-9)
 
 
+def test_overlapping_windows_are_trimmed_to_shared_valley_borders(bp):
+    centers, windows, info = bp.estimate_peak_windows(
+        num_bins=100, q_min=0.0, q_max=0.5, n_peaks=3,
+        prominence_factor=0.05, smoothing_sigma=1.0,
+        width_factor=12.0, min_width=0.05,
+    )
+
+    assert len(centers) == 3
+    # Every overlapping pair meets at one boundary rather than double-counting q.
+    np.testing.assert_allclose(windows[:-1, 1], windows[1:, 0])
+    assert np.all(windows[:-1, 1] >= centers[:-1])
+    assert np.all(windows[:-1, 1] <= centers[1:])
+
+    # With these separated synthetic families, the unconstrained profile valley
+    # lies inside each overlap and is therefore the selected shared boundary.
+    r_centers = info["r_centers"]
+    profile = info["profile"]
+    for i, border in enumerate(windows[:-1, 1]):
+        left = int(np.searchsorted(r_centers, centers[i], side="right"))
+        right = int(np.searchsorted(r_centers, centers[i + 1], side="left"))
+        valley = r_centers[left + int(np.argmin(profile[left:right]))]
+        assert border == pytest.approx(valley)
+
+
 def test_count_mode_agrees_with_intensity_mode_for_uniform_intensities(bp):
     """With every intensity equal to 1, the two profiles differ only by scale."""
     by_intensity, _, _ = bp.estimate_peak_windows(

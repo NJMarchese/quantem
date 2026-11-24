@@ -954,7 +954,9 @@ def estimate_peak_windows(
         q-values for peak centers (shape: n_peaks)
     peak_windows : array
         Window boundaries for each peak (shape: n_peaks, 2)
-        Each row is [q_min, q_max] for that peak
+        Each row is [q_min, q_max] for that peak. Adjacent proposed windows that
+        overlap are trimmed to a shared boundary at the smoothed-profile valley
+        between their centers (constrained to lie inside the overlap).
     peak_info : dict
         Additional information about detected peaks including:
         - 'heights': peak heights
@@ -1031,6 +1033,28 @@ def estimate_peak_windows(
     # Clip windows to data range
     peak_windows[:, 0] = np.maximum(peak_windows[:, 0], q_min)
     peak_windows[:, 1] = np.minimum(peak_windows[:, 1], q_max)
+
+    # Windows describe mutually exclusive radial families downstream. When two
+    # independently estimated windows overlap, put their common border at the
+    # lowest smoothed-profile bin between the detected peak centers. Constraining
+    # that valley to both the overlap and the center-to-center interval guarantees
+    # that this only trims windows and that each window retains its own center.
+    for i in range(len(peak_windows) - 1):
+        if peak_windows[i, 1] <= peak_windows[i + 1, 0]:
+            continue
+        left_index = int(top_peak_indices[i])
+        right_index = int(top_peak_indices[i + 1])
+        if right_index - left_index > 1:
+            between = intensity_smooth[left_index + 1:right_index]
+            valley_index = left_index + 1 + int(np.argmin(between))
+            valley = float(r_centers[valley_index])
+        else:
+            valley = float(0.5 * (peak_centers[i] + peak_centers[i + 1]))
+        border_low = max(float(peak_windows[i + 1, 0]), float(peak_centers[i]))
+        border_high = min(float(peak_windows[i, 1]), float(peak_centers[i + 1]))
+        border = float(np.clip(valley, border_low, border_high))
+        peak_windows[i, 1] = border
+        peak_windows[i + 1, 0] = border
     
     # Collect additional info
     peak_info = {
